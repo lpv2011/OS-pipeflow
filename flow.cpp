@@ -32,6 +32,7 @@ struct Concatenate {
 map<string, Node> nodes;
 map<string, PipeNode> pipes;
 map<string, Concatenate> concats;
+map<string, string> stderr_nodes;
 
 void execute_command(const string& command) {
     execlp("/bin/sh", "sh", "-c", command.c_str(), NULL);
@@ -52,13 +53,52 @@ string run_command(const string& command) {
         exit(1);
     }
 
-    if (pid == 0) {
+    if (pid == 0) {  // Child process
         close(pipefd[0]);
         dup2(pipefd[1], STDOUT_FILENO);
         close(pipefd[1]);
         execute_command(command);
-    } else {
+    } else {  // Parent process
         close(pipefd[1]);
+        char buffer[BUFFER_SIZE];
+        string result;
+        ssize_t bytes_read;
+        while ((bytes_read = read(pipefd[0], buffer, BUFFER_SIZE)) > 0) {
+            result.append(buffer, bytes_read);
+        }
+        close(pipefd[0]);
+        waitpid(pid, nullptr, 0);
+        return result;
+    }
+    return "";
+}
+
+string execute_stderr_node(const string& node_name) {
+    if (nodes.find(node_name) == nodes.end()) {
+        cerr << "Error: Unknown node name '" << node_name << "'" << endl;
+        exit(1);
+    }
+    string command = nodes[node_name].command;
+
+    int pipefd[2];
+    if (pipe(pipefd) == -1) {
+        perror("pipe");
+        exit(1);
+    }
+
+    pid_t pid = fork();
+    if (pid == -1) {
+        perror("fork");
+        exit(1);
+    }
+
+    if (pid == 0) {  // Child process
+        close(pipefd[0]); // Close read end
+        dup2(pipefd[1], STDERR_FILENO); // Redirect stderr to pipe
+        close(pipefd[1]);
+        execute_command(command);
+    } else {  // Parent process
+        close(pipefd[1]); // Close write end
         char buffer[BUFFER_SIZE];
         string result;
         ssize_t bytes_read;
@@ -82,8 +122,11 @@ string execute_part(const string& part) {
         return execute_pipe(pipes[part]);
     } else if (concats.find(part) != concats.end()) {
         return execute_concat(concats[part]);
+    } else if (stderr_nodes.find(part) != stderr_nodes.end()) {
+        return execute_stderr_node(stderr_nodes[part]);
     } else {
-        return run_command(part);
+        cerr << "Error: Unknown part name '" << part << "'" << endl;
+        exit(1);
     }
 }
 
@@ -102,11 +145,12 @@ string execute_pipe(const PipeNode& pipeNode) {
         exit(1);
     }
 
-    if (pid == 0) {
+    if (pid == 0) {  // Child process
         close(pipefd[0]);
         dup2(pipefd[1], STDOUT_FILENO);
         close(pipefd[1]);
 
+        // Create a pipe to feed input to the command
         int input_pipe[2];
         if (pipe(input_pipe) == -1) {
             perror("pipe");
@@ -119,12 +163,12 @@ string execute_pipe(const PipeNode& pipeNode) {
             exit(1);
         }
 
-        if (input_pid == 0) {
+        if (input_pid == 0) {  // Child of child, to write input
             close(input_pipe[0]);
             write(input_pipe[1], from_output.c_str(), from_output.size());
             close(input_pipe[1]);
             exit(0);
-        } else {
+        } else {  // Child, to execute the command
             close(input_pipe[1]);
             dup2(input_pipe[0], STDIN_FILENO);
             close(input_pipe[0]);
@@ -139,11 +183,16 @@ string execute_pipe(const PipeNode& pipeNode) {
                 string pipe_result = execute_pipe(pipes[pipeNode.to]);
                 cout << pipe_result;
                 exit(0);
+            } else if (stderr_nodes.find(pipeNode.to) != stderr_nodes.end()) {
+                string stderr_result = execute_stderr_node(stderr_nodes[pipeNode.to]);
+                cout << stderr_result;
+                exit(0);
             } else {
-                execute_command(pipeNode.to);
+                cerr << "Error: Unknown flow name '" << pipeNode.to << "'" << endl;
+                exit(1);
             }
         }
-    } else {
+    } else {  // Parent process
         close(pipefd[1]);
         char buffer[BUFFER_SIZE];
         string result;
@@ -180,7 +229,7 @@ void read_flow_file(const string& filename) {
     bool readingConcat = false;
 
     while (getline(file, line)) {
-        // Remove any newline characters
+        // Remove any trailing carriage return or newline characters
         line.erase(line.find_last_not_of("\r\n") + 1);
 
         if (line.empty()) {
@@ -191,6 +240,13 @@ void read_flow_file(const string& filename) {
         } else if (line.find("command=") == 0) {
             currentNode.command = line.substr(8);
             nodes[currentNode.name] = currentNode;
+        } else if (line.find("stderr=") == 0) {
+            string stderr_name = line.substr(7);
+            getline(file, line);
+            if (line.find("from=") == 0) {
+                string from_node = line.substr(5);
+                stderr_nodes[stderr_name] = from_node;
+            }
         } else if (line.find("pipe=") == 0) {
             currentPipe = PipeNode();
             currentPipe.name = line.substr(5);
@@ -203,7 +259,6 @@ void read_flow_file(const string& filename) {
             currentConcat = Concatenate();
             currentConcat.name = line.substr(12);
             readingConcat = true;
-        } else if (readingConcat && line.find("parts=") == 0) {
         } else if (readingConcat && line.find("part_") == 0) {
             size_t equal_pos = line.find('=');
             if (equal_pos != string::npos) {
@@ -214,6 +269,7 @@ void read_flow_file(const string& filename) {
             concats[currentConcat.name] = currentConcat;
             readingConcat = false;
 
+            // If a new concatenate starts immediately
             if (line.find("concatenate=") == 0) {
                 currentConcat = Concatenate();
                 currentConcat.name = line.substr(12);
@@ -222,6 +278,7 @@ void read_flow_file(const string& filename) {
         }
     }
 
+    // In case the file ends while reading a concatenate
     if (readingConcat) {
         concats[currentConcat.name] = currentConcat;
     }
@@ -238,20 +295,27 @@ int main(int argc, char* argv[]) {
     string flow_file = argv[1];
     string flow_name = argv[2];
 
+    // Read definitions from the flow file
     read_flow_file(flow_file);
 
+    // Check if flow_name is a pipe
     if (pipes.find(flow_name) != pipes.end()) {
         string output = execute_pipe(pipes[flow_name]);
         cout << output;
     }
- 
+    // Check if flow_name is a concatenate
     else if (concats.find(flow_name) != concats.end()) {
         string output = execute_concat(concats[flow_name]);
         cout << output;
     }
-
+    // Check if flow_name is a node
     else if (nodes.find(flow_name) != nodes.end()) {
         string output = run_command(nodes[flow_name].command);
+        cout << output;
+    }
+    // Check if flow_name is a stderr node
+    else if (stderr_nodes.find(flow_name) != stderr_nodes.end()) {
+        string output = execute_stderr_node(stderr_nodes[flow_name]);
         cout << output;
     } else {
         cerr << "Error: Unknown flow name '" << flow_name << "'" << endl;
