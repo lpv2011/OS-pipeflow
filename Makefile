@@ -6,7 +6,7 @@ CXXFLAGS = -std=c++11 -Wall -Wextra
 TARGET = flow
 
 # Source files
-SRC = hello.cpp
+SRC = flow.cpp
 
 # Build rules
 all: $(TARGET)
