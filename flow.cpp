@@ -1,3 +1,4 @@
+// Include necessary headers and using statements
 #include <iostream>
 #include <unistd.h>
 #include <sys/wait.h>
@@ -8,6 +9,7 @@
 #include <cstring>
 #include <fstream>
 #include <cctype>
+#include <regex>
 
 using namespace std;
 
@@ -35,6 +37,7 @@ map<string, PipeNode> pipes;
 map<string, Concatenate> concats;
 map<string, string> stderr_nodes;
 map<string, string> files;
+map<string, string> variables;
 
 vector<string> split_command(const string& command) {
     vector<string> args;
@@ -46,8 +49,10 @@ vector<string> split_command(const string& command) {
         char c = command[i];
         if (c == '\'' && !in_double_quote) {
             in_single_quote = !in_single_quote;
+            continue;
         } else if (c == '\"' && !in_single_quote) {
             in_double_quote = !in_double_quote;
+            continue;
         } else if (isspace(c) && !in_single_quote && !in_double_quote) {
             if (!current_arg.empty()) {
                 args.push_back(current_arg);
@@ -65,8 +70,27 @@ vector<string> split_command(const string& command) {
     return args;
 }
 
+string expand_variables(const string& command) {
+    string expanded_command = command;
+    regex var_regex("@(\\w+)");
+    smatch match;
+    string::const_iterator searchStart(expanded_command.cbegin());
+    while (regex_search(searchStart, expanded_command.cend(), match, var_regex)) {
+        string var_name = match[1];
+        if (variables.find(var_name) != variables.end()) {
+            expanded_command.replace(match.position(0), match.length(0), variables[var_name]);
+            searchStart = expanded_command.cbegin() + match.position(0) + variables[var_name].length();
+        } else {
+            cerr << "Error: Undefined variable @" << var_name << endl;
+            exit(1);
+        }
+    }
+    return expanded_command;
+}
+
 void execute_command(const string& command) {
-    vector<string> args = split_command(command);
+    string expanded_command = expand_variables(command);
+    vector<string> args = split_command(expanded_command);
 
     if (args.empty()) {
         cerr << "Error: Empty command" << endl;
@@ -186,7 +210,6 @@ string execute_part(const string& part) {
 
 string execute_pipe(const PipeNode& pipeNode) {
     string from_output;
-
     if (files.find(pipeNode.from) != files.end()) {
         ifstream infile(files[pipeNode.from]);
         if (!infile.is_open()) {
@@ -209,7 +232,7 @@ string execute_pipe(const PipeNode& pipeNode) {
         }
         outfile << from_output;
         outfile.close();
-        return ""; 
+        return "";
     }
 
     int pipefd[2];
@@ -224,11 +247,10 @@ string execute_pipe(const PipeNode& pipeNode) {
         exit(1);
     }
 
-    if (pid == 0) { 
+    if (pid == 0) {
         close(pipefd[0]);
         dup2(pipefd[1], STDOUT_FILENO);
         close(pipefd[1]);
-
         int input_pipe[2];
         if (pipe(input_pipe) == -1) {
             perror("pipe");
@@ -250,37 +272,12 @@ string execute_pipe(const PipeNode& pipeNode) {
             close(input_pipe[1]);
             dup2(input_pipe[0], STDIN_FILENO);
             close(input_pipe[0]);
-
-            if (nodes.find(pipeNode.to) != nodes.end()) {
-                execute_command(nodes[pipeNode.to].command);
-            } else if (concats.find(pipeNode.to) != concats.end()) {
-                string concat_result = execute_concat(concats[pipeNode.to]);
-                cout << concat_result;
-                exit(0);
-            } else if (pipes.find(pipeNode.to) != pipes.end()) {
-                string pipe_result = execute_pipe(pipes[pipeNode.to]);
-                cout << pipe_result;
-                exit(0);
-            } else if (stderr_nodes.find(pipeNode.to) != stderr_nodes.end()) {
-                string stderr_result = execute_stderr_node(stderr_nodes[pipeNode.to]);
-                cout << stderr_result;
-                exit(0);
-            } else if (files.find(pipeNode.to) != files.end()) {
-                ofstream outfile(files[pipeNode.to]);
-                if (!outfile.is_open()) {
-                    cerr << "Error opening file for writing: " << files[pipeNode.to] << endl;
-                    exit(1);
-                }
-                outfile << from_output;
-                outfile.close();
-                exit(0);
-            } else {
-                cerr << "Error: Unknown flow name '" << pipeNode.to << "'" << endl;
-                exit(1);
-            }
+            execute_command(nodes[pipeNode.to].command);
+            exit(0);
         }
     } else {
         close(pipefd[1]);
+
         char buffer[BUFFER_SIZE];
         string result;
         ssize_t bytes_read;
@@ -288,6 +285,7 @@ string execute_pipe(const PipeNode& pipeNode) {
             result.append(buffer, bytes_read);
         }
         close(pipefd[0]);
+
         waitpid(pid, nullptr, 0);
         return result;
     }
@@ -333,6 +331,7 @@ void read_flow_file(const string& filename) {
             if (!currentFileName.empty()) {
                 string fileName = line.substr(5);
                 files[currentFileName] = fileName;
+                variables[currentFileName] = fileName;
                 currentFileName.clear();
             } else {
                 cerr << "Error: 'name=' found without preceding 'file='" << endl;
@@ -357,6 +356,7 @@ void read_flow_file(const string& filename) {
             currentConcat = Concatenate();
             currentConcat.name = line.substr(12);
             readingConcat = true;
+        } else if (line.find("parts=") == 0) {
         } else if (readingConcat && line.find("part_") == 0) {
             size_t equal_pos = line.find('=');
             if (equal_pos != string::npos) {
