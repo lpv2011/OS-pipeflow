@@ -7,6 +7,7 @@
 #include <map>
 #include <cstring>
 #include <fstream>
+#include <cctype>
 
 using namespace std;
 
@@ -33,10 +34,53 @@ map<string, Node> nodes;
 map<string, PipeNode> pipes;
 map<string, Concatenate> concats;
 map<string, string> stderr_nodes;
+map<string, string> files;
+
+vector<string> split_command(const string& command) {
+    vector<string> args;
+    string current_arg;
+    bool in_single_quote = false;
+    bool in_double_quote = false;
+
+    for (size_t i = 0; i < command.length(); ++i) {
+        char c = command[i];
+        if (c == '\'' && !in_double_quote) {
+            in_single_quote = !in_single_quote;
+        } else if (c == '\"' && !in_single_quote) {
+            in_double_quote = !in_double_quote;
+        } else if (isspace(c) && !in_single_quote && !in_double_quote) {
+            if (!current_arg.empty()) {
+                args.push_back(current_arg);
+                current_arg.clear();
+            }
+        } else {
+            current_arg += c;
+        }
+    }
+
+    if (!current_arg.empty()) {
+        args.push_back(current_arg);
+    }
+
+    return args;
+}
 
 void execute_command(const string& command) {
-    execlp("/bin/sh", "sh", "-c", command.c_str(), NULL);
-    perror("execlp failed");
+    vector<string> args = split_command(command);
+
+    if (args.empty()) {
+        cerr << "Error: Empty command" << endl;
+        exit(1);
+    }
+
+    vector<char*> c_args;
+    for (auto& arg : args) {
+        c_args.push_back(const_cast<char*>(arg.c_str()));
+    }
+    c_args.push_back(nullptr);
+
+    execvp(c_args[0], c_args.data());
+    perror("execvp failed");
     exit(1);
 }
 
@@ -53,12 +97,12 @@ string run_command(const string& command) {
         exit(1);
     }
 
-    if (pid == 0) {  // Child process
+    if (pid == 0) { 
         close(pipefd[0]);
         dup2(pipefd[1], STDOUT_FILENO);
         close(pipefd[1]);
         execute_command(command);
-    } else {  // Parent process
+    } else { 
         close(pipefd[1]);
         char buffer[BUFFER_SIZE];
         string result;
@@ -92,13 +136,13 @@ string execute_stderr_node(const string& node_name) {
         exit(1);
     }
 
-    if (pid == 0) {  // Child process
-        close(pipefd[0]); // Close read end
-        dup2(pipefd[1], STDERR_FILENO); // Redirect stderr to pipe
+    if (pid == 0) { 
+        close(pipefd[0]); 
+        dup2(pipefd[1], STDERR_FILENO); 
         close(pipefd[1]);
         execute_command(command);
-    } else {  // Parent process
-        close(pipefd[1]); // Close write end
+    } else {  
+        close(pipefd[1]); 
         char buffer[BUFFER_SIZE];
         string result;
         ssize_t bytes_read;
@@ -124,6 +168,16 @@ string execute_part(const string& part) {
         return execute_concat(concats[part]);
     } else if (stderr_nodes.find(part) != stderr_nodes.end()) {
         return execute_stderr_node(stderr_nodes[part]);
+    } else if (files.find(part) != files.end()) {
+        ifstream infile(files[part]);
+        if (!infile.is_open()) {
+            cerr << "Error opening file: " << files[part] << endl;
+            exit(1);
+        }
+        stringstream buffer;
+        buffer << infile.rdbuf();
+        infile.close();
+        return buffer.str();
     } else {
         cerr << "Error: Unknown part name '" << part << "'" << endl;
         exit(1);
@@ -131,7 +185,32 @@ string execute_part(const string& part) {
 }
 
 string execute_pipe(const PipeNode& pipeNode) {
-    string from_output = execute_part(pipeNode.from);
+    string from_output;
+
+    if (files.find(pipeNode.from) != files.end()) {
+        ifstream infile(files[pipeNode.from]);
+        if (!infile.is_open()) {
+            cerr << "Error opening file: " << files[pipeNode.from] << endl;
+            exit(1);
+        }
+        stringstream buffer;
+        buffer << infile.rdbuf();
+        infile.close();
+        from_output = buffer.str();
+    } else {
+        from_output = execute_part(pipeNode.from);
+    }
+
+    if (files.find(pipeNode.to) != files.end()) {
+        ofstream outfile(files[pipeNode.to]);
+        if (!outfile.is_open()) {
+            cerr << "Error opening file for writing: " << files[pipeNode.to] << endl;
+            exit(1);
+        }
+        outfile << from_output;
+        outfile.close();
+        return ""; 
+    }
 
     int pipefd[2];
     if (pipe(pipefd) == -1) {
@@ -145,12 +224,11 @@ string execute_pipe(const PipeNode& pipeNode) {
         exit(1);
     }
 
-    if (pid == 0) {  // Child process
+    if (pid == 0) { 
         close(pipefd[0]);
         dup2(pipefd[1], STDOUT_FILENO);
         close(pipefd[1]);
 
-        // Create a pipe to feed input to the command
         int input_pipe[2];
         if (pipe(input_pipe) == -1) {
             perror("pipe");
@@ -163,12 +241,12 @@ string execute_pipe(const PipeNode& pipeNode) {
             exit(1);
         }
 
-        if (input_pid == 0) {  // Child of child, to write input
+        if (input_pid == 0) {
             close(input_pipe[0]);
             write(input_pipe[1], from_output.c_str(), from_output.size());
             close(input_pipe[1]);
             exit(0);
-        } else {  // Child, to execute the command
+        } else {
             close(input_pipe[1]);
             dup2(input_pipe[0], STDIN_FILENO);
             close(input_pipe[0]);
@@ -187,12 +265,21 @@ string execute_pipe(const PipeNode& pipeNode) {
                 string stderr_result = execute_stderr_node(stderr_nodes[pipeNode.to]);
                 cout << stderr_result;
                 exit(0);
+            } else if (files.find(pipeNode.to) != files.end()) {
+                ofstream outfile(files[pipeNode.to]);
+                if (!outfile.is_open()) {
+                    cerr << "Error opening file for writing: " << files[pipeNode.to] << endl;
+                    exit(1);
+                }
+                outfile << from_output;
+                outfile.close();
+                exit(0);
             } else {
                 cerr << "Error: Unknown flow name '" << pipeNode.to << "'" << endl;
                 exit(1);
             }
         }
-    } else {  // Parent process
+    } else {
         close(pipefd[1]);
         char buffer[BUFFER_SIZE];
         string result;
@@ -218,7 +305,7 @@ string execute_concat(const Concatenate& concat) {
 void read_flow_file(const string& filename) {
     ifstream file(filename);
     if (!file.is_open()) {
-        perror("Error opening file");
+        cerr << "Error opening flow file" << endl;
         exit(1);
     }
 
@@ -227,9 +314,9 @@ void read_flow_file(const string& filename) {
     PipeNode currentPipe;
     Concatenate currentConcat;
     bool readingConcat = false;
+    string currentFileName;
 
     while (getline(file, line)) {
-        // Remove any trailing carriage return or newline characters
         line.erase(line.find_last_not_of("\r\n") + 1);
 
         if (line.empty()) {
@@ -240,6 +327,17 @@ void read_flow_file(const string& filename) {
         } else if (line.find("command=") == 0) {
             currentNode.command = line.substr(8);
             nodes[currentNode.name] = currentNode;
+        } else if (line.find("file=") == 0) {
+            currentFileName = line.substr(5);
+        } else if (line.find("name=") == 0) {
+            if (!currentFileName.empty()) {
+                string fileName = line.substr(5);
+                files[currentFileName] = fileName;
+                currentFileName.clear();
+            } else {
+                cerr << "Error: 'name=' found without preceding 'file='" << endl;
+                exit(1);
+            }
         } else if (line.find("stderr=") == 0) {
             string stderr_name = line.substr(7);
             getline(file, line);
@@ -269,7 +367,6 @@ void read_flow_file(const string& filename) {
             concats[currentConcat.name] = currentConcat;
             readingConcat = false;
 
-            // If a new concatenate starts immediately
             if (line.find("concatenate=") == 0) {
                 currentConcat = Concatenate();
                 currentConcat.name = line.substr(12);
@@ -278,7 +375,6 @@ void read_flow_file(const string& filename) {
         }
     }
 
-    // In case the file ends while reading a concatenate
     if (readingConcat) {
         concats[currentConcat.name] = currentConcat;
     }
@@ -295,25 +391,23 @@ int main(int argc, char* argv[]) {
     string flow_file = argv[1];
     string flow_name = argv[2];
 
-    // Read definitions from the flow file
     read_flow_file(flow_file);
 
-    // Check if flow_name is a pipe
     if (pipes.find(flow_name) != pipes.end()) {
         string output = execute_pipe(pipes[flow_name]);
         cout << output;
     }
-    // Check if flow_name is a concatenate
+  
     else if (concats.find(flow_name) != concats.end()) {
         string output = execute_concat(concats[flow_name]);
         cout << output;
     }
-    // Check if flow_name is a node
+
     else if (nodes.find(flow_name) != nodes.end()) {
         string output = run_command(nodes[flow_name].command);
         cout << output;
     }
-    // Check if flow_name is a stderr node
+
     else if (stderr_nodes.find(flow_name) != stderr_nodes.end()) {
         string output = execute_stderr_node(stderr_nodes[flow_name]);
         cout << output;
