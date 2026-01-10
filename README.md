@@ -1,5 +1,12 @@
-Run 'make' in terminal, an executable will be created under the name 'flow'
-Command to Run: ./flow file.flow shenanigan
-flow - executable
-file.flow - .flow file with the set of intructions to follow
-shenanigan - process to perform from .flow file
+# OS-pipeflow
+
+A minimal **custom flow language** for chaining Linux commands, inspired by traditional shell pipelines.  
+Define reusable workflows using simple `.flow` files.
+Designed for learning OS concepts like processes and pipes
+
+## Build
+
+```bash
+git clone https://github.com/lpv2011/OS-pipeflow.git
+cd OS-pipeflow
+make
